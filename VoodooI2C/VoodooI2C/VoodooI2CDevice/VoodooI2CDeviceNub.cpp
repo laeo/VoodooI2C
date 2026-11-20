@@ -225,10 +225,6 @@ IOReturn VoodooI2CDeviceNub::getDeviceResources() {
 
     setProperty("sclHz", resource_parser.i2c_info.bus_speed, 32);
 
-    // There is actually no way to avoid APIC interrupt if it is valid
-    if (validateAPICInterrupt() == kIOReturnSuccess)
-        return kIOReturnSuccess;
-
     IOPCIDevice *pci_device { nullptr };
 
     pci_device = controller->nub->controller->physical_device.pci_device;
@@ -236,10 +232,27 @@ IOReturn VoodooI2CDeviceNub::getDeviceResources() {
     bool force_polling = checkKernelArg("-vi2c-force-polling");
     force_polling = force_polling || ((pci_device != nullptr) && (pci_device->getProperty("force-polling") != nullptr));
 
+    /* XXX xe3-macos: force polling has to win over validateAPICInterrupt().
+     *
+     * Upstream calls validateAPICInterrupt() first and returns immediately when
+     * it succeeds ("There is actually no way to avoid APIC interrupt if it is
+     * valid"), so the force-polling flag below could never be honoured on a
+     * platform that advertises a syntactically valid APIC interrupt.
+     * On Panther Lake the touchpad _CRS can select the SBFI branch
+     * (Interrupt(Level, ActiveLow, ExclusiveAndWake)) instead of the GpioInt
+     * branch, which makes validateAPICInterrupt() succeed even though VoodooGPIO
+     * has no GPIO/IRQ tables for this SoC. Returning here keeps both
+     * has_apic_interrupts and has_gpio_interrupts false, getInterruptType()
+     * reports "no interrupt" and the satellite falls back to IOTimerEventSource.
+     */
     if (force_polling) {
-        IOLog("%s::%s Forced polling mode, skipping GPIO interrupts\n", getName(), acpi_device->getName());
+        IOLog("%s::%s Forced polling mode, skipping APIC and GPIO interrupts\n", getName(), acpi_device->getName());
         return kIOReturnSuccess;
     }
+
+    // There is actually no way to avoid APIC interrupt if it is valid
+    if (validateAPICInterrupt() == kIOReturnSuccess)
+        return kIOReturnSuccess;
 
     if (resource_parser.found_gpio_interrupts) {
         IOLog("%s::%s Found valid GPIO interrupts\n", getName(), acpi_device->getName());
@@ -279,9 +292,23 @@ VoodooGPIO* VoodooI2CDeviceNub::getGPIOController() {
 IOReturn VoodooI2CDeviceNub::getInterruptType(int source, int* interrupt_type) {
     if (has_gpio_interrupts) {
         return gpio_controller->getInterruptType(gpio_pin, interrupt_type);
-    } else {
+    } else if (has_apic_interrupts) {
         return acpi_device->getInterruptType(source, interrupt_type);
     }
+
+    /* XXX xe3-macos: no usable interrupt source (polling mode).
+     *
+     * Report kIOReturnNoInterrupt instead of falling through to
+     * acpi_device->getInterruptType(). IOInterruptEventSource::init() ->
+     * registerInterruptHandler() calls provider->getInterruptType() and bails out
+     * on any non-success return, so IOInterruptEventSource::interruptEventSource()
+     * returns NULL and upstream VoodooI2CHID::handleStart() falls back to
+     * IOTimerEventSource (see VoodooI2C Satellites/VoodooI2CHID/VoodooI2CHIDDevice.cpp,
+     * "Warning: Could not get interrupt event source, using polling instead").
+     * The ACPI device may still carry a stale interrupt specifier that is not
+     * actually routed, so querying it is not equivalent to "no interrupt".
+     */
+    return kIOReturnNoInterrupt;
 }
 
 IOWorkLoop* VoodooI2CDeviceNub::getWorkLoop(void) const {
