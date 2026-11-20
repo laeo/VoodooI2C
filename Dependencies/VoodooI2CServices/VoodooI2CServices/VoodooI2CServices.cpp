@@ -57,13 +57,42 @@ bool VoodooI2CServices::start(IOService* provider) {
 }
 
 void VoodooI2CServices::stop(IOService* provider) {
-    device_matcher->remove();
-    terminate_matcher->remove();
-    
-    OSSafeReleaseNULL(device_matcher);
-    OSSafeReleaseNULL(terminate_matcher);
+    /*
+     * xe3-macos: fix an upstream use-after-free (verified by kernel panic in
+     * the macOS 26 VM, reproducible on every unload).
+     *
+     * IONotifier::remove() is documented (MacKernelSDK IOKit/IONotifier.h:50-57)
+     * as "Removes the notification request and releases it. Since creating an
+     * IONotifier instance will leave it with a retain count of one, creating an
+     * IONotifier and then removing it will destroy it."
+     *
+     * So after remove() the object is already deallocated and our own reference
+     * is gone. The original code then did OSSafeReleaseNULL(device_matcher),
+     * which dereferences the freed pointer to fetch its vtable:
+     *
+     *   panic(cpu 0): Kernel trap, type = 14=page fault
+     *   CR2: 0x0000000000000028
+     *   VoodooI2CServices : VoodooI2CServices::stop(IOService*) + 0x39
+     *
+     * +0x39 is the callq *0x28(%rax) of the release; the vtable slot read back
+     * 0 because the freed memory had been zeroed, hence the fault at 0x28.
+     *
+     * Correct sequence: call remove() once, then just NULL the pointers --
+     * never release them again. Both calls are NULL-guarded because stop()
+     * must tolerate a partially started driver (if addMatchingNotification()
+     * fails, the corresponding member is still NULL).
+     */
+    if (device_matcher) {
+        device_matcher->remove();
+        device_matcher = NULL;
+    }
+    if (terminate_matcher) {
+        terminate_matcher->remove();
+        terminate_matcher = NULL;
+    }
 
-    detachFromParent(getRegistryRoot(), gVoodooI2CPlane);
+    if (gVoodooI2CPlane)
+        detachFromParent(getRegistryRoot(), gVoodooI2CPlane);
 
     super::stop(provider);
 }
